@@ -1,0 +1,15 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: yellowbooks
+  labels:
+    app: yellowbooks
+
+---
+apiVersion: v1
+kind: ServiceAccount
+metadata:
+  name: yellowbooks-sa
+  namespace: yellowbooks
+  annotations:
+    eks.amazonaws.com/role-arn: arn:aws:iam::619425981538:role/yellowbooks-eks-role

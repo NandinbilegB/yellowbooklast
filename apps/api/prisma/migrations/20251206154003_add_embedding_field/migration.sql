@@ -1,0 +1,3 @@
+-- AlterTable
+ALTER TABLE "YellowBookEntry" ADD COLUMN     "embeddedAt" TIMESTAMP(3),
+ADD COLUMN     "embedding" DOUBLE PRECISION[] DEFAULT ARRAY[]::DOUBLE PRECISION[];

@@ -1,0 +1,177 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - develop
+  pull_request:
+    branches:
+      - main
+
+permissions:
+  actions: read
+  contents: read
+  id-token: write
+
+env:
+  AWS_REGION: ap-southeast-1
+  API_ECR_REPOSITORY: yellbook/api
+  WEB_ECR_REPOSITORY: yellbook/web
+
+jobs:
+  lint-and-build:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        node-version: [20]
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node-version }}
+          cache: 'npm'
+
+      - name: Cache Nx artifacts
+        uses: actions/cache@v3
+        with:
+          path: |
+            node_modules
+            .nx/cache
+          key: ${{ runner.os }}-nx-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-nx-
+
+      - name: Install Dependencies
+        run: npm install
+
+      - name: Run Lint
+        run: npm run lint 2>/dev/null || true
+
+      - name: Run Typecheck
+        run: npm run typecheck
+
+      - name: Build API & Web
+        env:
+          NEXT_PUBLIC_BACKEND_URL: http://localhost:3001
+          NEXTAUTH_SECRET: dummy-secret-for-build
+          GITHUB_ID: dummy
+          GITHUB_SECRET: dummy
+        run: npm run build
+
+  docker-build-push:
+    needs: lint-and-build
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [api, web]
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push Docker image - ${{ matrix.image }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.image }}
+          push: true
+          tags: |
+            ${{ steps.login-ecr.outputs.registry }}/yellbook/${{ matrix.image }}:${{ github.sha }}
+            ${{ steps.login-ecr.outputs.registry }}/yellbook/${{ matrix.image }}:latest
+
+      - name: Image digest
+        run: echo "Image pushed to ${{ steps.login-ecr.outputs.registry }}/yellbook/${{ matrix.image }}:${{ github.sha }}"
+
+  docker-build-pr:
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        image: [api, web]
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build Docker image (PR check) - ${{ matrix.image }}
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          file: Dockerfile.${{ matrix.image }}
+          push: false
+          tags: |
+            yellbook-${{ matrix.image }}:${{ github.sha }}
+            yellbook-${{ matrix.image }}:latest
+
+  security-scan:
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Get ECR registry
+        id: ecr-registry
+        run: |
+          REGISTRY=$(aws ecr get-authorization-token --query authorizationData[0].proxyEndpoint --output text | sed 's|https://||')
+          echo "registry=$REGISTRY" >> $GITHUB_OUTPUT
+
+      - name: Run Trivy vulnerability scanner
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'image'
+          image-ref: ${{ steps.ecr-registry.outputs.registry }}/yellbook/api:${{ github.sha }}
+          format: 'sarif'
+          output: 'trivy-results.json'
+        continue-on-error: true
+
+      - name: Upload Trivy results
+        uses: github/codeql-action/upload-sarif@v2
+        with:
+          sarif_file: 'trivy-results.json'
+        continue-on-error: true
+
+  health-check:
+    needs: docker-build-push
+    runs-on: ubuntu-latest
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Check ECR images
+        run: |
+          echo "=== API Image ===" 
+          aws ecr describe-images --repository-name yellbook/api --region ${{ env.AWS_REGION }} | jq '.imageDetails[0] | {digest: .imageDigest, size: .imageSizeInBytes, tags: .imageTags}' || true
+          echo ""
+          echo "=== Web Image ===" 
+          aws ecr describe-images --repository-name yellbook/web --region ${{ env.AWS_REGION }} | jq '.imageDetails[0] | {digest: .imageDigest, size: .imageSizeInBytes, tags: .imageTags}' || true

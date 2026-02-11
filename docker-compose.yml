@@ -1,0 +1,92 @@
+version: "3.8"
+
+services:
+  db:
+    image: postgres:16-alpine
+    container_name: yellbook-db
+    restart: unless-stopped
+    environment:
+      # Use env vars with safe defaults. Provide values in a local `.env` file.
+      POSTGRES_USER: ${POSTGRES_USER:-yellbook}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-yellbook}
+      POSTGRES_DB: ${POSTGRES_DB:-yellbook}
+      POSTGRES_PORT: ${POSTGRES_PORT:-5432}
+    ports:
+      - "${POSTGRES_PORT:-5432}:${POSTGRES_PORT:-5432}"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-yellbook}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: yellbook-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile.api
+    container_name: yellbook-api
+    restart: unless-stopped
+    environment:
+      # Compose will substitute values from the host env or .env file
+      DATABASE_URL: postgresql://${POSTGRES_USER:-yellbook}:${POSTGRES_PASSWORD:-yellbook}@db:${POSTGRES_PORT:-5432}/${POSTGRES_DB:-yellbook}
+      REDIS_HOST: redis
+      REDIS_PORT: "6379"
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      NODE_ENV: production
+      HOST: 0.0.0.0
+      PORT: 3001
+    ports:
+      - "3001:3001"
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3001"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  web:
+    build:
+      context: .
+      dockerfile: Dockerfile.web
+    container_name: yellbook-web
+    restart: unless-stopped
+    environment:
+      NEXT_PUBLIC_BACKEND_URL: ${NEXT_PUBLIC_BACKEND_URL:-http://api:3001}
+      INTERNAL_BACKEND_URL: ${INTERNAL_BACKEND_URL:-http://api:3001}
+    ports:
+      - "3000:3000"
+    depends_on:
+      api:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "wget", "--quiet", "--tries=1", "--spider", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+volumes:
+  postgres_data:
+  redis_data:
+
+networks:
+  default:
+    name: yellbook-network

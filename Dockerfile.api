@@ -1,0 +1,73 @@
+# Build stage
+FROM node:20-alpine AS builder
+
+WORKDIR /app
+
+COPY package.json package-lock.json nx.json tsconfig.base.json eslint.config.mjs ./
+COPY apps/api ./apps/api
+COPY libs ./libs
+
+RUN npm install
+
+# Generate Prisma client while dev dependencies are available
+RUN npx prisma generate --schema=./apps/api/prisma/schema.prisma
+
+# Build API with Nx from root
+# Build without Nx cache to avoid stale dist output inside Docker layers
+ENV NX_DAEMON=false
+RUN npx nx reset
+RUN npx nx build @yellbook/api --skip-nx-cache
+
+# Production dependencies stage (workspace-aware)
+FROM node:20-alpine AS prod-deps
+
+WORKDIR /app
+
+COPY package.json package-lock.json ./
+COPY apps/api/package.json ./apps/api/package.json
+COPY libs/config/package.json ./libs/config/package.json
+COPY libs/types/package.json ./libs/types/package.json
+
+ENV NODE_ENV=production
+RUN npm ci --omit=dev --ignore-scripts
+
+# Copy generated Prisma engine + client artifacts from builder
+COPY --from=builder /app/node_modules/.prisma ./node_modules/.prisma
+
+# Runtime stage
+FROM node:20-alpine
+
+WORKDIR /app
+
+# Install dumb-init
+RUN apk add --no-cache dumb-init
+
+# Copy package files
+COPY package.json package-lock.json ./
+
+# Copy production node_modules (includes workspace deps like @trpc/server)
+COPY --from=prod-deps /app/node_modules ./node_modules
+
+# Include Prisma CLI from builder so migration jobs can run without network access
+COPY --from=builder /app/node_modules/prisma ./node_modules/prisma
+COPY --from=builder /app/node_modules/.bin/prisma ./node_modules/.bin/prisma
+
+# Include Prisma engine binaries from builder (avoids runtime downloads)
+COPY --from=builder /app/node_modules/@prisma ./node_modules/@prisma
+
+# Copy built app from builder
+COPY --from=builder /app/dist/apps/api/ ./dist/apps/api/
+
+# Copy Prisma schema and migrations (used by the app; client is already generated)
+COPY apps/api/prisma ./prisma
+
+# Health check
+HEALTHCHECK --interval=30s --timeout=10s --start-period=5s --retries=3 \
+  CMD wget --quiet --tries=1 --spider http://localhost:3001 || exit 1
+
+EXPOSE 3001
+
+# Use dumb-init to handle signals properly
+ENTRYPOINT ["/usr/bin/dumb-init", "--"]
+
+CMD ["node", "dist/apps/api/main.js"]

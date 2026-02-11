@@ -1,0 +1,61 @@
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: db-migration
+  namespace: yellowbooks
+spec:
+  backoffLimit: 3
+  template:
+    spec:
+      serviceAccountName: yellowbooks-sa
+      restartPolicy: Never
+      containers:
+      - name: migrate
+        image: 619425981538.dkr.ecr.ap-southeast-1.amazonaws.com/yellbook/api:latest
+        imagePullPolicy: Always
+        command: 
+          - /bin/sh
+          - -c
+          - |
+            set -e
+
+            echo "Waiting for Postgres..."
+            i=0
+            until ./node_modules/.bin/prisma migrate deploy --schema ./prisma/schema.prisma; do
+              i=$((i+1))
+              if [ "$i" -ge 30 ]; then
+                echo "Prisma migrate failed after retries" >&2
+                exit 1
+              fi
+              echo "Postgres not ready yet; retrying in 5s... ($i/30)"
+              sleep 5
+            done
+
+            ./node_modules/.bin/prisma db seed --schema ./prisma/schema.prisma
+        env:
+        - name: DATABASE_URL
+          valueFrom:
+            configMapKeyRef:
+              name: yellowbooks-config
+              key: DATABASE_URL
+        - name: OPENAI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: yellowbooks-secrets
+              key: OPENAI_API_KEY
+        - name: GEMINI_API_KEY
+          valueFrom:
+            secretKeyRef:
+              name: yellowbooks-secrets
+              key: GEMINI_API_KEY
+        - name: NODE_ENV
+          value: production
+        resources:
+          requests:
+            memory: "256Mi"
+            cpu: "100m"
+          limits:
+            memory: "512Mi"
+            cpu: "500m"
+      imagePullSecrets:
+      - name: ecr-secret

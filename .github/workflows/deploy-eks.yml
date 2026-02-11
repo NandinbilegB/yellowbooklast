@@ -1,0 +1,138 @@
+name: Deploy to EKS
+
+on:
+  # Disabled for now - enable after EKS cluster is set up
+  # push:
+  #   branches:
+  #     - main
+  workflow_dispatch:
+
+env:
+  AWS_REGION: ap-southeast-1
+  CLUSTER_NAME: yellbook-eks
+  ECR_REGISTRY: 619425981538.dkr.ecr.ap-southeast-1.amazonaws.com
+  API_ECR_REPOSITORY: yellbook/api
+  WEB_ECR_REPOSITORY: yellbook/web
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+
+    steps:
+    - uses: actions/checkout@v4
+
+    - name: Set up Docker Buildx
+      uses: docker/setup-buildx-action@v3
+
+    - name: Configure AWS credentials
+      uses: aws-actions/configure-aws-credentials@v4
+      with:
+        role-to-assume: arn:aws:iam::619425981538:role/github-actions-eks-deploy-role
+        aws-region: ${{ env.AWS_REGION }}
+
+    - name: Login to Amazon ECR
+      id: login-ecr
+      uses: aws-actions/amazon-ecr-login@v2
+
+    - name: Build and push API image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.api
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.API_ECR_REPOSITORY }}:${{ github.sha }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.API_ECR_REPOSITORY }}:latest
+
+    - name: Build and push Web image
+      uses: docker/build-push-action@v5
+      with:
+        context: .
+        file: Dockerfile.web
+        push: true
+        tags: |
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.WEB_ECR_REPOSITORY }}:${{ github.sha }}
+          ${{ steps.login-ecr.outputs.registry }}/${{ env.WEB_ECR_REPOSITORY }}:latest
+
+    - name: Check if cluster exists
+      id: check_cluster
+      run: |
+        if aws eks describe-cluster --name ${{ env.CLUSTER_NAME }} --region ${{ env.AWS_REGION }} 2>/dev/null; then
+          echo "cluster_exists=true" >> $GITHUB_OUTPUT
+        else
+          echo "cluster_exists=false" >> $GITHUB_OUTPUT
+          echo "⚠️ EKS cluster '${{ env.CLUSTER_NAME }}' not found. Cluster creation may still be in progress."
+        fi
+
+    - name: Update kubeconfig
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        aws eks update-kubeconfig \
+          --name ${{ env.CLUSTER_NAME }} \
+          --region ${{ env.AWS_REGION }}
+
+    - name: Ensure namespace exists
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        kubectl apply -f k8s/manifests/00-namespace.yaml
+
+    - name: Create ECR secret
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        kubectl create secret docker-registry ecr-secret \
+          --docker-server=${{ env.ECR_REGISTRY }} \
+          --docker-username=AWS \
+          --docker-password=$(aws ecr get-login-password --region ${{ env.AWS_REGION }}) \
+          -n yellowbooks \
+          --dry-run=client -o yaml | kubectl apply -f -
+
+    - name: Apply Kubernetes manifests
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        kubectl apply -f k8s/manifests/01-configmap-secret.yaml
+        kubectl apply -f k8s/manifests/02-postgres.yaml
+        kubectl apply -f k8s/manifests/08-redis.yaml
+        sleep 30
+        kubectl delete job db-migration -n yellowbooks --ignore-not-found=true
+        kubectl apply -f k8s/manifests/03-migration-job.yaml
+        sleep 10
+        kubectl apply -f k8s/manifests/04-api-deployment.yaml
+        kubectl apply -f k8s/manifests/05-web-deployment.yaml
+        kubectl apply -f k8s/manifests/06-hpa.yaml
+        kubectl apply -f k8s/manifests/07-ingress.yaml
+
+        # Force pods to restart so they pull the newly pushed :latest images
+        kubectl rollout restart deployment/api -n yellowbooks
+        kubectl rollout restart deployment/web -n yellowbooks
+
+    - name: Wait for deployments
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        kubectl rollout status deployment/api -n yellowbooks --timeout=5m || true
+        kubectl rollout status deployment/web -n yellowbooks --timeout=5m || true
+
+    - name: Check pod status
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        kubectl get pods -n yellowbooks
+        kubectl get svc -n yellowbooks
+        kubectl get ingress -n yellowbooks
+
+    - name: Get ALB endpoint
+      if: steps.check_cluster.outputs.cluster_exists == 'true'
+      run: |
+        echo "Waiting for ALB to be ready..."
+        kubectl get ingress -n yellowbooks
+
+    - name: Report deployment status
+      run: |
+        if [ "${{ steps.check_cluster.outputs.cluster_exists }}" == "true" ]; then
+          echo "✅ Deployment to EKS cluster completed successfully"
+        else
+          echo "⚠️ EKS cluster not ready yet"
+          echo "📋 Once cluster is created, deployment will proceed automatically on next push"
+          echo "📚 See AWS_QUOTA_LIMITATION.md for details on EKS cluster creation"
+        fi

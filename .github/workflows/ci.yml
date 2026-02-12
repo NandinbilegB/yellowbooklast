@@ -25,6 +25,22 @@ jobs:
     strategy:
       matrix:
         node-version: [20]
+
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: yellbook
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U postgres"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
@@ -48,6 +64,9 @@ jobs:
       - name: Install Dependencies
         run: npm install
 
+      - name: Generate Prisma Client
+        run: npx prisma generate --schema=apps/api/prisma/schema.prisma
+
       - name: Run Lint
         run: npm run lint 2>/dev/null || true
 
@@ -56,6 +75,7 @@ jobs:
 
       - name: Build API & Web
         env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/yellbook?schema=public
           NEXT_PUBLIC_BACKEND_URL: http://localhost:3001
           NEXTAUTH_SECRET: dummy-secret-for-build
           GITHUB_ID: dummy
@@ -170,8 +190,8 @@ jobs:
 
       - name: Check ECR images
         run: |
-          echo "=== API Image ===" 
+          echo "=== API Image ==="
           aws ecr describe-images --repository-name yellbook/api --region ${{ env.AWS_REGION }} | jq '.imageDetails[0] | {digest: .imageDigest, size: .imageSizeInBytes, tags: .imageTags}' || true
           echo ""
-          echo "=== Web Image ===" 
+          echo "=== Web Image ==="
           aws ecr describe-images --repository-name yellbook/web --region ${{ env.AWS_REGION }} | jq '.imageDetails[0] | {digest: .imageDigest, size: .imageSizeInBytes, tags: .imageTags}' || true

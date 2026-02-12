@@ -10,7 +10,7 @@ async function seed() {
     const adminEmails = [
       "admin@yellbook.com",
       // Add your GitHub account email here to become admin
-      "javhaa233@gmail.com", // Example: your GitHub email
+      "bbasannandinbileg@gmail.com", // Example: your GitHub email
     ];
 
     for (const email of adminEmails) {
